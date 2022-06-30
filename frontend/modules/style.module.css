@@ -1,0 +1,6 @@
+.nav_bg {
+  /* background-image: linear-gradient( 174.2deg,  rgb(161, 31, 118) 7.1%, rgb(109, 23, 117) 67.4% ); */
+  background: radial-gradient(50% 50% at 50% 0%, #00FFB0 -800%, rgba(0, 255, 176, 0) 85%), radial-gradient(50% 50% at 50% 100%, #00FFB0 -800%, rgba(0, 255, 176, 0) 85%), #0D1B24;
+  border-image: linear-gradient(to left, #003340 1%, #37f2f0 50%, #003340 100%) 0 0 100% 0/0 0 1px 0 stretch;
+  border-bottom: 1px solid transparent;
+}

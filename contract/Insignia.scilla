@@ -1,0 +1,697 @@
+scilla_version 0
+
+(***************************************************)
+(*               Associated library                *)
+(***************************************************)
+
+import BoolUtils IntUtils 
+library Insignia
+
+let one_msg = 
+  fun (msg : Message) => 
+    let nil_msg = Nil {Message} in
+    Cons {Message} msg nil_msg
+
+(* Error events *)
+type Error =
+| CodeNotOwner
+| CodeNonePendingOwner
+| CodeNotPendingOwner
+| CodeInsigniaTemplateNotFound
+| CodeInsigniaTemplateExists
+| CodeInsigniaNotFound
+| CodeIssuePendingNotFound
+| CodeIssuePendingInvalid
+| CodeIssueNotVoted
+| CodeInvalidSigner
+| CodeInvalidSignature
+| CodeInvalidTreasuryWallet
+| CodeAlreadyVoted
+| CodeAlreadyAgainsted
+
+let make_error =
+  fun (result : Error) =>
+    let result_code = 
+      match result with
+      | CodeNotOwner                 => Int32 -1
+      | CodeNonePendingOwner         => Int32 -2
+      | CodeNotPendingOwner          => Int32 -3
+      | CodeInsigniaTemplateNotFound => Int32 -4
+      | CodeInsigniaTemplateExists   => Int32 -5
+      | CodeInsigniaNotFound         => Int32 -6
+      | CodeIssuePendingNotFound     => Int32 -7
+      | CodeIssuePendingInvalid      => Int32 -8
+      | CodeIssueNotVoted            => Int32 -9
+      | CodeInvalidSigner            => Int32 -10
+      | CodeInvalidSignature         => Int32 -11
+      | CodeInvalidTreasuryWallet    => Int32 -12
+      | CodeAlreadyVoted             => Int32 -13
+      | CodeAlreadyAgainsted         => Int32 -14
+      end
+    in
+    { _exception : "Error"; code : result_code }
+
+(* Insignia template name, template url, id count, total supply *)
+type InsigniaTemplate =
+| Template of String String Uint128 Uint128
+
+(* voted by golden, approved by candidate *)
+type IssuePending =
+| Pending of ByStr20 Uint128
+
+let zero = Uint128 0
+let one = Uint128 1
+let none = None {ByStr20}
+let true = True
+let false = False
+
+let get_bool =
+  fun (some_val: Option Bool) =>
+  match some_val with
+  | Some val => val
+  | None => False
+  end
+
+(***************************************************)
+(*             The contract definition             *)
+(***************************************************)
+
+contract Insignia
+(
+  initial_owner : ByStr20
+)
+
+field contract_owner : ByStr20 = initial_owner
+field pending_owner : Option ByStr20 = none
+field treasury_address : Option ByStr20 = none
+
+field total_votable : Uint128 = Uint128 0
+field vote_win_rate : Uint128 = Uint128 66
+
+(* Mapping between insignia template id to insignia object *)
+field insignia_templates: Map Uint32 InsigniaTemplate = Emp Uint32 InsigniaTemplate
+
+(* Mapping between insignia template id to ZRC4 accessibility *)
+field treasury_access: Map Uint32 Bool = Emp Uint32 Bool
+
+(* Mapping between insignia template id to submit proposal accessibility *)
+field proposal_access: Map Uint32 Bool = Emp Uint32 Bool
+
+(* Mapping between insignia template id to vote accessibility *)
+field vote_access: Map Uint32 Bool = Emp Uint32 Bool
+
+(* Mapping between insignia template id to issue insignia accessibility *)
+field issue_access: Map Uint32 Bool = Emp Uint32 Bool
+
+(* Mapping from insignia template id to insignia owner by the insignia id *)
+field insignia_owners: Map Uint32 (Map Uint128 ByStr20) = Emp Uint32 (Map Uint128 ByStr20)
+
+(* Mapping from insignia template id to insignia pending object by the insignia id *)
+field insignia_pending: Map Uint32 (Map Uint128 IssuePending) = Emp Uint32 (Map Uint128 IssuePending)
+
+(* Mapping from insignia template id to [voter->voted?] by the insignia id *)
+field issue_voting: Map Uint32 (Map Uint128 (Map ByStr20 Bool)) = Emp Uint32 (Map Uint128 (Map ByStr20 Bool))
+
+(**************************************)
+(*             Procedures             *)
+(**************************************)
+
+(* Emit Errors *)
+procedure ThrowError(err : Error)
+  e = make_error err;
+  throw e
+end
+
+procedure IsOwner(address: ByStr20)
+  current_owner <- contract_owner;
+  is_owner = builtin eq current_owner address;
+  match is_owner with
+  | True =>
+  | False =>
+    err = CodeNotOwner;
+    ThrowError err
+  end
+end
+
+procedure IsPendingOwner(address: ByStr20)
+  maybe_pending_owner <- pending_owner;
+  match maybe_pending_owner with
+  | Some current_pending_owner =>
+    is_pending_owner = builtin eq current_pending_owner address;
+    match is_pending_owner with
+    | True =>
+    | False =>
+      err = CodeNotPendingOwner;
+      ThrowError err
+    end
+  | None =>
+    err = CodeNonePendingOwner;
+    ThrowError err
+  end
+end
+
+(* Ensure signature is valid *)
+procedure IsValidSignature(
+  pubkey: ByStr33,
+  sender_template_id: Uint32,
+  sender_insignia_id: Uint128,
+  candidate: ByStr20,
+  template_id: Uint32,
+  pending_id: Uint128,
+  signature: ByStr64
+)
+  from = builtin schnorr_get_address pubkey;
+  from_hash = builtin sha256hash from;
+  sender_template_hash = builtin sha256hash sender_template_id;
+  sender_insignia_hash = builtin sha256hash sender_insignia_id;
+  candidate_hash = builtin sha256hash candidate;
+  template_hash = builtin sha256hash template_id;
+  pending_hash = builtin sha256hash pending_id;
+  p0_hash = builtin concat from_hash sender_template_hash;
+  p1_hash = builtin concat p0_hash sender_insignia_hash;
+  p2_hash = builtin concat p1_hash candidate_hash;
+  p3_hash = builtin concat p2_hash template_hash;
+  p4_hash = builtin concat p3_hash pending_hash;
+  p4_hash = builtin to_string p4_hash;
+  idx = Uint32 2;
+  len = Uint32 384;
+  p4_hash = builtin substr p4_hash idx len;
+  msg_hash = builtin sha256hash p4_hash;
+  cheque_hash = builtin to_bystr msg_hash;
+  valid_sig = builtin schnorr_verify pubkey cheque_hash signature;
+  match valid_sig with
+  | True =>
+  | False =>
+    err = CodeInvalidSignature;
+    ThrowError err
+  end
+end
+
+(* Ensure voting user has valid insignia *)
+procedure IsValidToVote(pubkey: ByStr33, sender_template_id: Uint32, sender_insignia_id: Uint128)
+  from = builtin schnorr_get_address pubkey;
+  current_owner <- contract_owner;
+  sender_insignia <- insignia_owners[sender_template_id][sender_insignia_id];
+  valid_insignia =
+    match sender_insignia with
+    | Some insignia_owner_address => builtin eq from insignia_owner_address
+    | None => False
+    end;
+  issueable <- issue_access[sender_template_id];
+  issueable_value = get_bool issueable;
+  is_valid_user = andb issueable_value valid_insignia;
+  match is_valid_user with
+  | True =>
+  | False =>
+    err = CodeInsigniaNotFound;
+    ThrowError err
+  end
+end
+
+(* Vote to issue insignia to a candidate by using self insignia *)
+procedure VoteIssueInsignia(template_id: Uint32, pending_id: Uint128, candidate: ByStr20)
+  old_vote <- issue_voting[template_id][pending_id][candidate];
+  old_voted = get_bool old_vote;
+  match old_voted with
+  | True =>
+    err = CodeAlreadyVoted;
+    ThrowError err
+  | False =>
+    maybe_pending <- insignia_pending[template_id][pending_id];
+    match maybe_pending with
+    | Some (Pending candidate_v voted) =>
+      new_v = builtin add voted one;
+      pending = Pending candidate_v new_v;
+      insignia_pending[template_id][pending_id] := pending;
+      issue_voting[template_id][pending_id][candidate] := true;
+      e = { _eventname: "VoteIssueSuccess"; status: "Success"; candidate: candidate; template_id: template_id };
+      event e
+    | None =>
+      err = CodeIssuePendingNotFound;
+      ThrowError err
+    end
+  end
+end
+
+(* Against to issue insignia to a candidate by using self insignia *)
+procedure AgainstIssueInsignia(template_id: Uint32, pending_id: Uint128, candidate: ByStr20)
+  old_vote <- issue_voting[template_id][pending_id][candidate];
+  old_voted = get_bool old_vote;
+  match old_voted with
+  | False =>
+    err = CodeAlreadyAgainsted;
+    ThrowError err
+  | True =>
+    maybe_pending <- insignia_pending[template_id][pending_id];
+    match maybe_pending with
+    | Some (Pending candidate_v voted) =>
+      new_v = builtin sub voted one;
+      pending = Pending candidate_v new_v;
+      insignia_pending[template_id][pending_id] := pending;
+      issue_voting[template_id][pending_id][candidate] := false;
+      e = { _eventname: "AgainstIssueSuccess"; status: "Success"; candidate: candidate; template_id: template_id };
+      event e
+    | None =>
+      err = CodeIssuePendingNotFound;
+      ThrowError err
+    end
+  end
+end
+
+(* Ensure user has access to treasury wallet *)
+procedure IsValidToTreasury(from: ByStr20, sender_template_id: Uint32, sender_insignia_id: Uint128)
+  current_owner <- contract_owner;
+  sender_insignia <- insignia_owners[sender_template_id][sender_insignia_id];
+  valid_insignia =
+    match sender_insignia with
+    | Some insignia_owner_address => builtin eq from insignia_owner_address
+    | None => False
+    end;
+  access <- treasury_access[sender_template_id];
+  accessable = get_bool access;
+  is_valid_user = andb accessable valid_insignia;
+  match is_valid_user with
+  | True =>
+  | False =>
+    err = CodeInvalidSigner;
+    ThrowError err
+  end
+end
+
+(***************************************)
+(*             Transitions             *)
+(***************************************)
+
+(* @dev: Issue a insignia to a candidate. Map of insignia holders if their request is valid *)
+(* @param pubkey:             Public Key of the request issue insignia.                     *)
+(* @param sender_template_id: Insignia template ID of request sender.                       *)
+(* @param sender_insignia_id: Insignia ID of request sender.                                *)
+(* @param candidate:          Address whose be issued insignia.                             *)
+(* @param template_id:        Insignia template id whose be issued insignia.                *)
+(* @param signature:          The signature of the cheque by requester to authorize issue.  *)
+transition IssueInsignia(
+  pubkey: ByStr33,
+  sender_template_id: Uint32,
+  sender_insignia_id: Uint128,
+  candidate: ByStr20,
+  template_id: Uint32,
+  pending_id: Uint128,
+  signature: ByStr64
+)
+  IsValidSignature pubkey sender_template_id sender_insignia_id candidate template_id pending_id signature;
+  from = builtin schnorr_get_address pubkey;
+  current_owner <- contract_owner;
+  sender_insignia <- insignia_owners[sender_template_id][sender_insignia_id];
+  valid_insignia =
+    match sender_insignia with
+    | Some insignia_owner_address => builtin eq from insignia_owner_address
+    | None => False
+    end;
+  issueable <- issue_access[sender_template_id];
+  issueable_value = get_bool issueable;
+  is_owner = builtin eq from current_owner;
+  has_issue_access = andb issueable_value valid_insignia;
+  owner_vote = orb is_owner has_issue_access;
+  is_candidate = builtin eq from candidate;
+  is_valid_user = orb owner_vote is_candidate;
+  match is_valid_user with
+  | True =>
+    template <- insignia_templates[template_id];
+    match template with
+    | Some (Template template_name template_url id_count total_supply) =>
+      pending = Pending candidate zero;
+      insignia_pending[template_id][pending_id] := pending;
+      e = { _eventname: "IssueInsigniaSuccess"; status: "Success"; candidate: candidate; template_id: template_id };
+      event e
+    | None =>
+      err = CodeInsigniaTemplateNotFound;
+      ThrowError err
+    end
+  | False =>
+    err = CodeInvalidSigner;
+    ThrowError err
+  end
+end
+
+(* @dev: Vote a insignia to a candidate. Only Gold insignia holder can vote to issue insignia. *)
+transition VoteIssue(
+  pubkey: ByStr33,
+  sender_template_id: Uint32,
+  sender_insignia_id: Uint128,
+  candidate: ByStr20,
+  template_id: Uint32,
+  pending_id: Uint128,
+  signature: ByStr64
+)
+  IsValidSignature pubkey sender_template_id sender_insignia_id candidate template_id pending_id signature;
+  IsValidToVote pubkey sender_template_id sender_insignia_id;
+  VoteIssueInsignia template_id pending_id _sender
+end
+
+(* @dev: Against issue a insignia to a candidate. Only Gold insignia holder can against to issue insignia. *)
+transition AgainstIssue(
+  pubkey: ByStr33,
+  sender_template_id: Uint32,
+  sender_insignia_id: Uint128,
+  candidate: ByStr20,
+  template_id: Uint32,
+  pending_id: Uint128,
+  signature: ByStr64
+)
+  IsValidSignature pubkey sender_template_id sender_insignia_id candidate template_id pending_id signature;
+  IsValidToVote pubkey sender_template_id sender_insignia_id;
+  AgainstIssueInsignia template_id pending_id _sender
+end
+
+(* @dev: Issue a insignia to a candidate. Only candidate can approve. *)
+transition ApproveIssue(
+  template_id: Uint32,
+  pending_id: Uint128
+)
+  maybe_pending <- insignia_pending[template_id][pending_id];
+  match maybe_pending with
+  | Some (Pending candidate voted) =>
+    hundred = Uint128 100;
+    total_v <- total_votable;
+    win_rate <- vote_win_rate;
+    current = builtin mul voted hundred;
+    win_limit = builtin mul total_v win_rate;
+    is_valid_rate1 = builtin lt win_limit current;
+    is_valid_rate2 = builtin eq win_limit current;
+    is_valid_rate = orb is_valid_rate1 is_valid_rate2;
+    is_valid_user = builtin eq candidate _sender;
+    is_valid = andb is_valid_rate is_valid_user;
+    match is_valid with
+    | True =>
+      template <- insignia_templates[template_id];
+      match template with
+      | Some (Template template_name template_url id_count total_supply) =>
+        delta = Uint128 1;
+        new_id = builtin add id_count delta;
+        new_supply = builtin add total_supply delta;
+        new_template = Template template_name template_url new_id new_supply;
+        insignia_templates[template_id] := new_template;
+        insignia_owners[template_id][new_id] := candidate;
+        delete insignia_pending[template_id][pending_id];
+
+        issueable <- issue_access[template_id];
+        issueable_value = get_bool issueable;
+        match issueable_value with
+        | True =>
+          old_total_v <- total_votable;
+          new_v = builtin add old_total_v one;
+          total_votable := new_v
+        | False =>
+        end;
+
+        e = { _eventname: "MintInsigniaSuccess"; status: "Success"; candidate: candidate; template_id: template_id; insignia_id: new_id };
+        event e
+      | None =>
+        err = CodeInsigniaTemplateNotFound;
+        ThrowError err
+      end
+    | False =>
+      err = CodeIssuePendingInvalid;
+      ThrowError err
+    end
+  | None =>
+    err = CodeIssuePendingNotFound;
+    ThrowError err
+  end
+end
+
+(* @dev: Create a new insignia template. Only owner can create. *)
+(* @param template_id:   Id of insigina template.               *)
+(* @param template_name: Name of the insigina template.         *)
+(* @param template_url:  Metadata url of the insigina template. *)
+transition CreateInsigniaTemplate(template_id: Uint32, template_name: String, template_url: String)
+  (* IsAuthority; *)
+  insignia_exist <- exists insignia_templates[template_id];
+  match insignia_exist with
+  | False =>
+    template = Template template_name template_url zero zero;
+    insignia_templates[template_id] := template;
+    e = {
+      _eventname: "CreateInsigniaTemplateSuccess";
+      status: "Success"; sender: _sender;
+      template_id: template_id; template_name: template_name; template_url: template_url
+    };
+    event e
+  | True =>
+    err = CodeInsigniaTemplateExists;
+    ThrowError err
+  end
+end
+
+(* @dev: Remove a insignia template. Only owner can remove. *)
+(* @param template_id:   ID of insigina template            *)
+transition RemoveInsigniaTemplate(template_id: Uint32)
+  insignia_exist <- exists insignia_templates[template_id];
+  match insignia_exist with
+  | True =>
+    delete insignia_templates[template_id];
+    delete insignia_pending[template_id];
+    e = {
+      _eventname: "RemoveInsigniaTemplateSuccess";
+      status: "Success"; sender: _sender;
+      template_id: template_id
+    };
+    event e
+  | False =>
+    err = CodeInsigniaTemplateNotFound;
+    ThrowError err
+  end
+end
+
+(* @dev: Set accessibility of specific insignia template for treasury wallet. *)
+transition SetTreasuryAccess(template_id: Uint32, access: Bool)
+  insignia_exist <- exists insignia_templates[template_id];
+  match insignia_exist with
+  | True =>
+    treasury_access[template_id] := access;
+    e = {
+      _eventname: "SetTreasuryAccessSuccess";
+      status: "Success"; sender: _sender;
+      template_id: template_id;
+      access: access
+    };
+    event e
+  | False =>
+    err = CodeInsigniaTemplateNotFound;
+    ThrowError err
+  end
+end
+
+(* @dev: Set accessibility of specific insignia template for creating proposal. *)
+transition SetProposalAccess(template_id: Uint32, access: Bool)
+  insignia_exist <- exists insignia_templates[template_id];
+  match insignia_exist with
+  | True =>
+    proposal_access[template_id] := access;
+    e = {
+      _eventname: "SetProposalAccessSuccess";
+      status: "Success"; sender: _sender;
+      template_id: template_id;
+      access: access
+    };
+    event e
+  | False =>
+    err = CodeInsigniaTemplateNotFound;
+    ThrowError err
+  end
+end
+
+(* @dev: Set accessibility of specific insignia template for voting. *)
+transition SetVoteAccess(template_id: Uint32, access: Bool)
+  insignia_exist <- exists insignia_templates[template_id];
+  match insignia_exist with
+  | True =>
+    vote_access[template_id] := access;
+    e = {
+      _eventname: "SetVoteAccessSuccess";
+      status: "Success"; sender: _sender;
+      template_id: template_id;
+      access: access
+    };
+    event e
+  | False =>
+    err = CodeInsigniaTemplateNotFound;
+    ThrowError err
+  end
+end
+
+(* @dev: Set accessibility of specific insignia template for voting issue insignia. *)
+transition SetIssueAccess(template_id: Uint32, access: Bool)
+  insignia_exist <- exists insignia_templates[template_id];
+  match insignia_exist with
+  | True =>
+    issue_access[template_id] := access;
+    insignia_obj <- insignia_templates[template_id];
+    match insignia_obj with
+    | Some (Template template_name template_url id_count total_supply) =>
+    old_total_v <- total_votable;
+      match access with
+      | True =>
+        new_v = builtin add old_total_v total_supply;
+        total_votable := new_v
+      | False =>
+        new_v = builtin sub old_total_v total_supply;
+        total_votable := new_v
+      end
+    | None =>
+    end;
+    e = {
+      _eventname: "SetIssueAccessSuccess";
+      status: "Success"; sender: _sender;
+      template_id: template_id;
+      access: access
+    };
+    event e
+  | False =>
+    err = CodeInsigniaTemplateNotFound;
+    ThrowError err
+  end
+end
+
+(* @dev: Set treasury ZRC4 wallet address *)
+transition SetTreasuryAddress(wallet_address: ByStr20)
+  new_address = Some {ByStr20} wallet_address;
+  treasury_address := new_address
+end
+
+(* Submit a transaction for future signoff *)
+transition SubmitTransactionToTreasuryWallet(
+  template_id: Uint32,
+  insignia_id: Uint128,
+  recipient : ByStr20,
+  amount : Uint128,
+  deadline : BNum,
+  tag : String
+)
+  IsValidToTreasury _sender template_id insignia_id;
+  wallet_address <- treasury_address;
+  match wallet_address with
+  | Some address =>
+    msg_to_zrc4 =  {
+      _tag : "SubmitTransaction"; _recipient: address; _amount: Uint128 0;
+      recipient: recipient; amount: amount; deadline: deadline; tag: tag
+    };
+    msgs = one_msg msg_to_zrc4;
+    send msgs
+  | None =>
+    err = CodeInvalidTreasuryWallet;
+    ThrowError err
+  end
+end
+
+(* Submit a transaction for future signoff *)
+transition SendMessageToTreasuryWallet(template_id: Uint32, insignia_id: Uint128, action_name: String, transaction_id: Uint32)
+  IsValidToTreasury _sender template_id insignia_id;
+  wallet_address <- treasury_address;
+  match wallet_address with
+  | Some address =>
+    msg_to_zrc4 =  {
+      _tag : action_name; _recipient: address; _amount: Uint128 0;
+      transactionId: transaction_id
+    };
+    msgs = one_msg msg_to_zrc4;
+    send msgs
+  | None =>
+    err = CodeInvalidTreasuryWallet;
+    ThrowError err
+  end
+end
+
+(* Add fund to treasury wallet *)
+transition AddFundsToTreasuryWallet(template_id: Uint32, insignia_id: Uint128)
+  IsValidToTreasury _sender template_id insignia_id;
+  wallet_address <- treasury_address;
+  match wallet_address with
+  | Some address =>
+    accept;
+    msg_to_zrc4 =  {
+      _tag : "AddFunds"; _recipient: address; _amount: _amount
+    };
+    msgs = one_msg msg_to_zrc4;
+    send msgs
+  | None =>
+    err = CodeInvalidTreasuryWallet;
+    ThrowError err
+  end
+end
+
+(* @dev: Transfers contract ownership to a new address. 
+  The new address must call the AcceptOwnership transition to finalize the transfer. *)
+(* @param new_owner: Address of the new contract_owner.                              *)
+transition TransferOwnership(new_owner: ByStr20)
+  IsOwner _sender;
+  o = Some {ByStr20} new_owner;
+  pending_owner := o;
+  e = {_eventname : "OwnershipTransferInitiated"; contract_owner : _sender; pending_owner : new_owner};
+  event e
+end
+
+(* @dev: Finalizes transfer of contract ownership. Must be called by the new contract_owner. *)
+transition AcceptOwnership()
+  IsPendingOwner _sender;
+  previous_contract_owner <- contract_owner;
+  contract_owner := _sender;
+  pending_owner := none;
+  e = {_eventname : "OwnershipTransferAccepted"; previous_contract_owner : previous_contract_owner; contract_owner : _sender};
+  event e
+end
+
+(* @dev: Execute issue Bronze and withdraw PELE after voting. Must be called by the contract_owner. *)
+transition WinningVote(
+  candidate: ByStr20,
+  distributor: ByStr20,
+  template_id: Uint32,
+  amount: Uint128
+)
+  IsOwner _sender;
+  template <- insignia_templates[template_id];
+  match template with
+  | Some (Template template_name template_url id_count total_supply) =>
+    delta = Uint128 1;
+    new_id = builtin add id_count delta;
+    new_supply = builtin add total_supply delta;
+    new_template = Template template_name template_url new_id new_supply;
+    insignia_templates[template_id] := new_template;
+    insignia_owners[template_id][new_id] := candidate;
+
+    issueable <- issue_access[template_id];
+    issueable_value = get_bool issueable;
+    match issueable_value with
+    | True =>
+      old_total_v <- total_votable;
+      new_v = builtin add old_total_v one;
+      total_votable := new_v
+    | False =>
+    end;
+
+    e = { _eventname: "MintInsigniaSuccess"; status: "Success"; candidate: candidate; template_id: template_id; insignia_id: new_id };
+    event e;
+
+    wallet_address <- treasury_address;
+    match wallet_address with
+    | Some address =>
+      msg_to_zrc4 =  {
+        _tag : "Withdraw"; _recipient: address; _amount: Uint128 0; distributor: distributor; amount: amount
+      };
+      msgs = one_msg msg_to_zrc4;
+      send msgs
+    | None =>
+      err = CodeInvalidTreasuryWallet;
+      ThrowError err
+    end
+  | None =>
+    err = CodeInsigniaTemplateNotFound;
+    ThrowError err
+  end
+end
+
+transition TreasuryWithdrawSuccessCallBack(
+  distrubutor : ByStr20,
+  amount : Uint128
+)
+end
